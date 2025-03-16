@@ -30,6 +30,54 @@ mail = Mail(app)
 client = MongoClient("mongodb://localhost:27017/")
 db = client["user_database"]
 users_collection = db["users"]
+questions_collection = db["questions"]
+counters_collection = db["counters"]
+
+
+# ------------------ Function to Get Next Auto-Incremented ID ------------------
+def get_next_question_id():
+    counter = counters_collection.find_one_and_update(
+        {"_id": "question_id"},
+        {"$inc": {"sequence_value": 1}},  # Increment sequence_value by 1
+        upsert=True,
+        return_document=True
+    )
+    return counter["sequence_value"]
+
+
+# ------------------ Add Question API ------------------
+@app.route("/add-question", methods=["POST"])
+def add_question():
+    data = request.json
+
+    # Validate required fields
+    if not all(key in data for key in ["question", "options", "correct"]):
+        return jsonify({"message": "Missing required fields"}), 400
+
+    # Ensure 'options' is a list
+    if not isinstance(data["options"], list) or len(data["options"]) != 4:
+        return jsonify({"message": "Options should be a list of exactly 4 items"}), 400
+
+    # Get next unique question ID
+    new_id = get_next_question_id()
+
+    question_data = {
+        "id": new_id,
+        "question": data["question"],
+        "options": data["options"],
+        "correct": data["correct"]
+    }
+
+    # Insert question into MongoDB
+    questions_collection.insert_one(question_data)
+
+    return jsonify({"message": "Question added successfully", "id": new_id}), 201
+
+# ------------------ Get Questions API ------------------
+@app.route("/get-questions", methods=["GET"])
+def get_questions():
+    questions = list(questions_collection.find({}, {"_id": 0}))  # Exclude MongoDB _id field
+    return jsonify(questions)
 
 
 # ------------------ User Registration (Updated) ------------------
