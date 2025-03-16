@@ -1,98 +1,153 @@
 from flask import Flask, request, jsonify
-from flask_pymongo import PyMongo
-from flask_bcrypt import Bcrypt
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required
-import secrets
 from flask_cors import CORS
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_mail import Mail, Message
+from pymongo import MongoClient
+import secrets
+import datetime
+import os
 
 app = Flask(__name__)
-app.config["MONGO_URI"] = "mongodb://localhost:27017/mydatabase"
-app.config["JWT_SECRET_KEY"] = "supersecretkey"
-CORS(app)
-
-mongo = PyMongo(app)
+CORS(app)  # Enable CORS for frontend communication
 bcrypt = Bcrypt(app)
+
+# Configure JWT
+app.config["JWT_SECRET_KEY"] = "supersecretkey"  # Change this in production
 jwt = JWTManager(app)
 
+# Configure Flask-Mail
+app.config["MAIL_SERVER"] = "smtp.gmail.com"
+app.config["MAIL_PORT"] = 587
+app.config["MAIL_USE_TLS"] = True
+app.config["MAIL_USERNAME"] = "trygeneralusage@gmail.com"  # Replace with your email
+app.config["MAIL_PASSWORD"] = "itveondvcywplqrf"  # Use App Password if using Gmail
+app.config["MAIL_DEFAULT_SENDER"] = "trygeneralusage@gmail.com"
+
+mail = Mail(app)
+
+# Configure MongoDB
+client = MongoClient("mongodb://localhost:27017/")
+db = client["user_database"]
+users_collection = db["users"]
 
 
-
+# ------------------ User Registration (Updated) ------------------
 @app.route("/signup", methods=["POST"])
 def signup():
     data = request.json
+
+    # Extract form data
+    first_name = data.get("firstName")
+    last_name = data.get("lastName")
     email = data.get("email")
     password = data.get("password")
+    guardian_name = data.get("guardianName")
+    guardian_contact = data.get("guardianContact")
+    address = data.get("address")
+    city = data.get("city")
+    state = data.get("state")
+    country = data.get("country")
+    pin_code = data.get("pinCode")
 
-    if mongo.db.users.find_one({"email": email}):
+    # Validate required fields
+    if not (
+            first_name and last_name and email and password and guardian_name and guardian_contact and address and city and state and country and pin_code):
+        return jsonify({"message": "All fields are required"}), 400
+
+    # Check if the email is already registered
+    if users_collection.find_one({"email": email}):
         return jsonify({"message": "User already exists"}), 400
 
+    # Hash the password
     hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
-    mongo.db.users.insert_one({"email": email, "password": hashed_password})
+
+    # Store user in database
+    user_data = {
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": email,
+        "password": hashed_password,
+        "guardian_name": guardian_name,
+        "guardian_contact": guardian_contact,
+        "address": {
+            "street": address,
+            "city": city,
+            "state": state,
+            "country": country,
+            "pin_code": pin_code
+        }
+    }
+
+    users_collection.insert_one(user_data)
 
     return jsonify({"message": "User registered successfully"}), 201
 
+
+# ------------------ User Login ------------------
 @app.route("/signin", methods=["POST"])
 def signin():
     data = request.json
     email = data.get("email")
     password = data.get("password")
 
-    user = mongo.db.users.find_one({"email": email})
+    user = users_collection.find_one({"email": email})
     if not user or not bcrypt.check_password_hash(user["password"], password):
-        return jsonify({"message": "Invalid email or password"}), 401
+        return jsonify({"message": "Invalid credentials"}), 401
 
-    access_token = create_access_token(identity=email)
-    return jsonify({"message": "Login successful", "token": access_token}), 200
+    access_token = create_access_token(identity=email, expires_delta=datetime.timedelta(hours=1))
+    return jsonify({"message": "Login successful", "token": access_token, "username": user["first_name"]}), 200
 
 
+# ------------------ Protected Route (Dashboard) ------------------
+@app.route("/dashboard", methods=["GET"])
+@jwt_required()
+def dashboard():
+    current_user = get_jwt_identity()
+    return jsonify({"message": f"Welcome {current_user} to the dashboard!"})
+
+
+# ------------------ Forgot Password (Send Reset Link) ------------------
 @app.route("/forgot-password", methods=["POST"])
 def forgot_password():
     data = request.json
     email = data.get("email")
 
-    if not email:
-        return jsonify({"message": "Email is required"}), 400
-
-    user = mongo.db.users.find_one({"email": email})
-
+    user = users_collection.find_one({"email": email})
     if not user:
-        return jsonify({"message": "Email not found"}), 404
+        return jsonify({"message": "User not found"}), 404
 
-    # Generate a secure reset token
     reset_token = secrets.token_hex(16)
+    users_collection.update_one({"email": email}, {"$set": {"reset_token": reset_token}})
 
-    # Store the token in the database
-    mongo.db.users.update_one({"email": email}, {"$set": {"reset_token": reset_token}})
+    reset_link = f"http://localhost:3000/reset-password?token={reset_token}&email={email}"
 
-    return jsonify({"message": "Password reset token generated", "reset_token": reset_token}), 200
+    # Send Email
+    msg = Message("Password Reset Request", recipients=[email])
+    msg.body = f"Click the link below to reset your password:\n\n{reset_link}\n\nIf you did not request this, ignore this email."
+
+    try:
+        mail.send(msg)
+        return jsonify({"message": "Reset link sent to email"}), 200
+    except Exception as e:
+        return jsonify({"message": "Failed to send email", "error": str(e)}), 500
 
 
+# ------------------ Reset Password ------------------
 @app.route("/reset-password", methods=["POST"])
 def reset_password():
     data = request.json
     email = data.get("email")
-    reset_token = data.get("reset_token")
     new_password = data.get("new_password")
+    reset_token = data.get("token")
 
-    if not email or not reset_token or not new_password:
-        return jsonify({"message": "All fields are required"}), 400
-
-    user = mongo.db.users.find_one({"email": email})
-
+    user = users_collection.find_one({"email": email, "reset_token": reset_token})
     if not user:
-        return jsonify({"message": "Email not found"}), 404
-
-    if "reset_token" not in user or user["reset_token"] != reset_token:
-        return jsonify({"message": "Invalid or expired reset token"}), 400
-
-    # Validate new password
-    new_password = new_password.strip()
-    if not new_password:
-        return jsonify({"message": "Password cannot be empty"}), 400
+        return jsonify({"message": "Invalid reset token"}), 400
 
     hashed_password = bcrypt.generate_password_hash(new_password).decode("utf-8")
 
-    mongo.db.users.update_one(
+    users_collection.update_one(
         {"email": email},
         {"$set": {"password": hashed_password}, "$unset": {"reset_token": ""}}
     )
